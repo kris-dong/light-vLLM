@@ -144,6 +144,7 @@ async def run_real_demo(
     prompts: List[str],
     system_msg: str,
     max_new: int,
+    sequential: bool = False,
 ) -> None:
     from transformers import AutoTokenizer
     from .engine import TransformersBackend
@@ -290,17 +291,26 @@ async def run_real_demo(
         # The first token in r.output_tokens is from prefill; the rest from
         # decode. Drop any chat-template control tokens for display.
         text = tok.decode(r.output_tokens, skip_special_tokens=True).strip()
+        # Per-engine prefix-cache stats so the user sees the cache fill up.
+        psnap = prefill_engine.snapshot()["prefix_cache"]
         print("─" * 72)
         print(f"[req {idx}] prompt: {prompt_text!r}")
         print(f"[req {idx}] tokens_in={req.prompt_len}  "
               f"tokens_out={len(r.output_tokens)}  "
               f"ttft={r.ttft_ms:6.1f}ms  total={elapsed:6.1f}ms  "
               f"prefill={r.prefill_engine}  decode={r.decode_engine}")
+        print(f"[req {idx}] prefix_cache(prefill): hits={psnap['hits']} "
+              f"misses={psnap['misses']} entries={psnap['entries']} "
+              f"tokens_saved={psnap['tokens_saved']}")
         print(f"[req {idx}] response: {text}")
 
-    await asyncio.gather(*[
-        run_one(i, p, r) for i, (p, r) in enumerate(zip(prompts, requests))
-    ])
+    if sequential:
+        for i, (p, r) in enumerate(zip(prompts, requests)):
+            await run_one(i, p, r)
+    else:
+        await asyncio.gather(*[
+            run_one(i, p, r) for i, (p, r) in enumerate(zip(prompts, requests))
+        ])
 
     print("─" * 72)
     print(f"[final] prefill={prefill_engine.snapshot()}")
@@ -400,6 +410,10 @@ def main() -> None:
     p.add_argument("--num-requests", type=int, default=2,
                    help="If no --prompt/--prompts-file given, use the first N "
                         "built-in demo prompts.")
+    p.add_argument("--sequential", action="store_true",
+                   help="Submit prompts one at a time. Reveals prefix-cache "
+                        "hits when prompts share a prefix; otherwise "
+                        "concurrent submits all start before any caches.")
     args = p.parse_args()
 
     if args.mock:
@@ -413,6 +427,7 @@ def main() -> None:
         prompts=user_prompts,
         system_msg=args.system,
         max_new=args.max_new,
+        sequential=args.sequential,
     ))
 
 

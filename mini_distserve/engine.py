@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 
@@ -71,8 +72,16 @@ def _resolve_loadable_id_and_cache(model_path: str) -> Tuple[str, Optional[str]]
 class Backend(Protocol):
     """Abstracts the forward pass so we can swap mock <-> real Qwen-7B."""
 
-    async def prefill(self, request: Request) -> Tuple[int, Dict[str, Any]]:
-        """Returns (first_token_id, kv_state_handle)."""
+    async def prefill(
+        self,
+        request: Request,
+        cached_kv: Optional[Dict[str, Any]] = None,
+        cached_tokens: int = 0,
+    ) -> Tuple[int, Dict[str, Any]]:
+        """Run prefill. If ``cached_kv`` is given, treat its ``past`` as the KV
+        for the first ``cached_tokens`` prompt tokens and only forward the rest
+        of the prompt — i.e., resume prefill from a cached prefix.
+        Returns (first_token_id, kv_state_handle)."""
         ...
 
     async def decode_step(
@@ -85,6 +94,18 @@ class Backend(Protocol):
         self, request_id: str, kv_state: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Hook for decode engine to install KV transferred from prefill."""
+        ...
+
+    async def snapshot_prefix(
+        self,
+        request_id: str,
+        kv_state: Dict[str, Any],
+        num_tokens: int,
+    ) -> Dict[str, Any]:
+        """Detached snapshot of the first ``num_tokens`` of ``kv_state`` so the
+        engine's prefix cache can survive the original request finishing.
+        Implementations should ``.clone()`` tensors so future request growth
+        doesn't corrupt the cache."""
         ...
 
     async def release(self, request_id: str) -> None:
@@ -107,13 +128,18 @@ class MockBackend:
         self.kv_xfer_ms_per_block = kv_xfer_ms_per_block
         self._kv: Dict[str, Dict[str, Any]] = {}
 
-    async def prefill(self, request: Request) -> Tuple[int, Dict[str, Any]]:
-        ms = request.prompt_len * self.prefill_ms_per_token
+    async def prefill(
+        self,
+        request: Request,
+        cached_kv: Optional[Dict[str, Any]] = None,
+        cached_tokens: int = 0,
+    ) -> Tuple[int, Dict[str, Any]]:
+        # On a cache hit only forward the suffix; sleep simulates that compute.
+        suffix_tokens = max(1, request.prompt_len - max(0, cached_tokens))
+        ms = suffix_tokens * self.prefill_ms_per_token
         await asyncio.sleep(ms / 1000.0)
-        # "KV state" is just metadata in mock.
         kv = {"len": request.prompt_len, "next_pos": request.prompt_len}
         self._kv[request.request_id] = kv
-        # Pseudo-deterministic first token.
         first_token = (sum(request.prompt_tokens[-8:]) + 7) % 32000
         return first_token, kv
 
@@ -133,6 +159,15 @@ class MockBackend:
         await asyncio.sleep(n_blocks * self.kv_xfer_ms_per_block / 1000.0)
         self._kv[request_id] = dict(kv_state)
         return self._kv[request_id]
+
+    async def snapshot_prefix(
+        self,
+        request_id: str,
+        kv_state: Dict[str, Any],
+        num_tokens: int,
+    ) -> Dict[str, Any]:
+        # No tensors in mock; just record the cached length.
+        return {"len": num_tokens, "next_pos": num_tokens}
 
     async def release(self, request_id: str) -> None:
         self._kv.pop(request_id, None)
@@ -210,24 +245,86 @@ class TransformersBackend:
         self.max_new_tokens_cap = max_new_tokens_cap
         self._kv: Dict[str, Any] = {}
 
-    async def prefill(self, request: Request) -> Tuple[int, Dict[str, Any]]:
+    async def prefill(
+        self,
+        request: Request,
+        cached_kv: Optional[Dict[str, Any]] = None,
+        cached_tokens: int = 0,
+    ) -> Tuple[int, Dict[str, Any]]:
         torch = self.torch
-        input_ids = torch.tensor(
-            [list(request.prompt_tokens)], dtype=torch.long, device=self.model.device
-        )
+        device = self.model.device
         loop = asyncio.get_event_loop()
 
-        def _run() -> Tuple[int, Any]:
-            with torch.inference_mode():
-                out = self.model(input_ids=input_ids, use_cache=True)
-            logits = out.logits[:, -1, :]
-            tok = int(torch.argmax(logits, dim=-1).item())
-            return tok, out.past_key_values
+        if cached_kv is None or cached_tokens <= 0:
+            # Cold prefill: forward the full prompt.
+            input_ids = torch.tensor(
+                [list(request.prompt_tokens)], dtype=torch.long, device=device,
+            )
 
-        first_token, past = await loop.run_in_executor(None, _run)
+            def _run_cold() -> Tuple[int, Any]:
+                with torch.inference_mode():
+                    out = self.model(input_ids=input_ids, use_cache=True)
+                logits = out.logits[:, -1, :]
+                tok = int(torch.argmax(logits, dim=-1).item())
+                return tok, out.past_key_values
+
+            first_token, past = await loop.run_in_executor(None, _run_cold)
+        else:
+            # Cache hit: clone the cached KV (so this request's growth doesn't
+            # corrupt the shared cache) and forward only the suffix tokens.
+            cached_past = cached_kv["past"]
+            suffix = list(request.prompt_tokens[cached_tokens:])
+
+            def _run_resume() -> Tuple[int, Any]:
+                cloned = _clone_past(cached_past, device, torch)
+                if not suffix:
+                    # Prompt is exactly the cached prefix — re-run the last
+                    # cached token so we can produce a next-token prediction.
+                    truncated = _truncate_past(cloned, cached_tokens - 1, torch)
+                    ids = torch.tensor(
+                        [[request.prompt_tokens[cached_tokens - 1]]],
+                        dtype=torch.long, device=device,
+                    )
+                    used_past = truncated
+                else:
+                    ids = torch.tensor([suffix], dtype=torch.long, device=device)
+                    used_past = cloned
+                with torch.inference_mode():
+                    out = self.model(
+                        input_ids=ids,
+                        past_key_values=used_past,
+                        use_cache=True,
+                    )
+                logits = out.logits[:, -1, :]
+                tok = int(torch.argmax(logits, dim=-1).item())
+                return tok, out.past_key_values
+
+            first_token, past = await loop.run_in_executor(None, _run_resume)
+
         kv = {"past": past, "len": request.prompt_len, "next_pos": request.prompt_len}
         self._kv[request.request_id] = kv
         return first_token, kv
+
+    async def snapshot_prefix(
+        self,
+        request_id: str,
+        kv_state: Dict[str, Any],
+        num_tokens: int,
+    ) -> Dict[str, Any]:
+        torch = self.torch
+        loop = asyncio.get_event_loop()
+        past = kv_state.get("past")
+        if past is None:
+            return {"past": None, "len": num_tokens, "next_pos": num_tokens}
+
+        def _snapshot() -> Dict[str, Any]:
+            return {
+                "past": _truncate_past(past, num_tokens, torch),
+                "len": num_tokens,
+                "next_pos": num_tokens,
+            }
+
+        return await loop.run_in_executor(None, _snapshot)
 
     async def decode_step(
         self, request_id: str, prev_token: int, kv_state: Dict[str, Any]
@@ -253,40 +350,110 @@ class TransformersBackend:
     async def receive_kv(
         self, request_id: str, kv_state: Dict[str, Any]
     ) -> Dict[str, Any]:
-        # KV produced on the prefill engine's GPU has to be moved to this
-        # engine's GPU before decode can use it. In a real disaggregated
-        # deployment this is the NCCL/RDMA hop; in-process we do an explicit
-        # `.to(device)`. We mutate ``kv_state["past"]`` in place so the prefill
-        # engine's eviction path doesn't see stale tensors.
+        # In a real disaggregated deployment this is the NCCL/RDMA hop;
+        # in-process we do an explicit ``.to(device)`` for each layer's K/V.
+        # IMPORTANT: build a fresh dict (and a fresh DynamicCache) instead of
+        # mutating ``kv_state`` in place — the same dict reference is held by
+        # the prefill engine's still-active seq, and its scheduler may run a
+        # spurious step() between handoff and eviction. Mutating would leave
+        # the prefill seq pointing at a cache on the wrong GPU.
         torch = self.torch
         target = self.model.device
         past = kv_state.get("past")
-        if past is not None:
-            kv_state["past"] = _move_past_kv(past, target, torch)
-        self._kv[request_id] = kv_state
-        return kv_state
+        moved_past = _move_past_kv(past, target, torch) if past is not None else None
+        new_kv = {**kv_state, "past": moved_past}
+        self._kv[request_id] = new_kv
+        return new_kv
 
     async def release(self, request_id: str) -> None:
         self._kv.pop(request_id, None)
 
 
 def _move_past_kv(past, target_device, torch):
-    """Move HF past_key_values to ``target_device``. Handles both the legacy
-    tuple-of-tuples form and the newer ``DynamicCache`` object."""
-    # DynamicCache: has .key_cache / .value_cache lists of tensors per layer.
+    """Return a NEW past_key_values on ``target_device``. Does not mutate the
+    input — both DynamicCache and legacy-tuple inputs come back as fresh
+    objects so the source engine's references aren't disturbed."""
     if hasattr(past, "key_cache") and hasattr(past, "value_cache"):
-        for i, (k, v) in enumerate(zip(past.key_cache, past.value_cache)):
-            if k.device != target_device:
-                past.key_cache[i] = k.to(target_device, non_blocking=True)
-            if v.device != target_device:
-                past.value_cache[i] = v.to(target_device, non_blocking=True)
-        return past
-    # Legacy: tuple of (k, v) per layer.
+        from transformers import DynamicCache  # type: ignore
+        out = DynamicCache()
+        new_keys = []
+        new_vals = []
+        seen = 0
+        for k, v in zip(past.key_cache, past.value_cache):
+            kk = k.to(target_device) if k.device != target_device else k
+            vv = v.to(target_device) if v.device != target_device else v
+            new_keys.append(kk)
+            new_vals.append(vv)
+            seen = kk.shape[-2]
+        out.key_cache = new_keys
+        out.value_cache = new_vals
+        out._seen_tokens = seen
+        return out
+    # Legacy tuple-of-tuples form.
     moved = []
     for k, v in past:
-        moved.append((k.to(target_device, non_blocking=True),
-                      v.to(target_device, non_blocking=True)))
+        kk = k.to(target_device) if k.device != target_device else k
+        vv = v.to(target_device) if v.device != target_device else v
+        moved.append((kk, vv))
     return tuple(moved)
+
+
+def _clone_past(past, target_device, torch):
+    """Deep-copy past_key_values onto ``target_device`` so writes by a later
+    forward call don't mutate the shared prefix cache. Sets the destination
+    DynamicCache's lists directly to avoid ``update()``'s placeholder-on-CPU
+    behavior — see ``_truncate_past`` for the same pattern."""
+    if hasattr(past, "key_cache") and hasattr(past, "value_cache"):
+        from transformers import DynamicCache  # type: ignore
+        out = DynamicCache()
+        new_keys = []
+        new_vals = []
+        seen = 0
+        for k, v in zip(past.key_cache, past.value_cache):
+            kk = k.to(target_device, copy=True).detach()
+            vv = v.to(target_device, copy=True).detach()
+            new_keys.append(kk)
+            new_vals.append(vv)
+            seen = kk.shape[-2]
+        out.key_cache = new_keys
+        out.value_cache = new_vals
+        out._seen_tokens = seen
+        return out
+    return tuple(
+        (k.to(target_device, copy=True).detach(),
+         v.to(target_device, copy=True).detach())
+        for k, v in past
+    )
+
+
+def _truncate_past(past, num_tokens, torch):
+    """Return a detached past_key_values containing only the first
+    ``num_tokens`` of context per layer. Cheap to call — used both for
+    snapshotting a prefix and for the prompt==prefix edge case.
+
+    Builds the new DynamicCache by setting its key_cache/value_cache lists
+    directly (without going through ``update()``). Going through ``update``
+    appends ``torch.tensor([])`` placeholders for any "skipped" layers using
+    the default device (CPU), which contaminates a later forward pass; direct
+    assignment avoids that path entirely.
+    """
+    if hasattr(past, "key_cache") and hasattr(past, "value_cache"):
+        from transformers import DynamicCache  # type: ignore
+        out = DynamicCache()
+        new_keys = []
+        new_vals = []
+        for k, v in zip(past.key_cache, past.value_cache):
+            new_keys.append(k[:, :, :num_tokens, :].clone().detach())
+            new_vals.append(v[:, :, :num_tokens, :].clone().detach())
+        out.key_cache = new_keys
+        out.value_cache = new_vals
+        out._seen_tokens = num_tokens
+        return out
+    return tuple(
+        (k[:, :, :num_tokens, :].clone().detach(),
+         v[:, :, :num_tokens, :].clone().detach())
+        for k, v in past
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +471,37 @@ class _ActiveSeq:
     output: List[int] = field(default_factory=list)
     # Set when the request finishes.
     done: asyncio.Event = field(default_factory=asyncio.Event)
+    # On a pure-prefill engine in the disaggregated path the seq lives in
+    # _active only briefly (until handoff + evict). Skip it in step() so the
+    # prefill scheduler doesn't waste compute decoding a sequence that's
+    # about to be evicted.
+    decode_eligible: bool = True
+
+
+@dataclass
+class _PrefixEntry:
+    """A cached prefix's state on this engine.
+
+    The bookkeeping side: ``block_ids`` are pinned in the engine's KVAllocator
+    under a synthetic owner id (``__prefix__:<hash>``) so a request that hits
+    this prefix can re-use those block ids via refcount, and so the blocks
+    survive the originating request's completion.
+
+    The compute side: ``kv_snapshot`` is a backend-specific opaque handle —
+    for ``TransformersBackend`` it's a cloned ``DynamicCache`` of length
+    ``num_tokens``; for ``MockBackend`` it's metadata only.
+    """
+
+    prefix_hash: str
+    num_tokens: int
+    num_blocks: int
+    block_ids: List[int]
+    kv_snapshot: Any
+    last_used: float = 0.0
+
+
+def _prefix_owner_id(prefix_hash: str) -> str:
+    return f"__prefix__:{prefix_hash}"
 
 
 class Engine:
@@ -317,6 +515,8 @@ class Engine:
         backend: Backend,
         max_batch_size: int = 64,
         kv_safety_margin_blocks: int = 32,
+        prefix_cache_capacity: int = 32,
+        prefix_cache_min_blocks: int = 1,
     ) -> None:
         self.engine_id = engine_id
         self.role = role
@@ -339,16 +539,113 @@ class Engine:
         self.recent_tpot_ms: float = 0.0
         self.waiting_queue_len: int = 0
 
+        # Prefix cache: hash -> _PrefixEntry. OrderedDict gives LRU semantics
+        # (oldest at head, recently-used at tail).
+        self._prefix_index: "OrderedDict[str, _PrefixEntry]" = OrderedDict()
+        self._prefix_capacity = prefix_cache_capacity
+        self._prefix_min_blocks = prefix_cache_min_blocks
+        # Stats.
+        self.prefix_hits: int = 0
+        self.prefix_misses: int = 0
+        self.prefix_tokens_saved: int = 0  # cumulative tokens skipped via cache
+
+    # ---- prefix cache helpers --------------------------------------------------
+
+    def _max_prefix_blocks_for_request(self, request: Request) -> int:
+        block_size = self.partition.block_size_tokens
+        target = request.prefix_len_for_cache // block_size
+        # Leave at least one suffix token so the backend always has a forward
+        # to run (and so duplicate-prompt requests still produce a next token).
+        upper = max(0, (request.prompt_len - 1) // block_size)
+        return min(target, upper)
+
+    def _prefix_lookup(self, request: Request) -> Optional[_PrefixEntry]:
+        h = request.prefix_hash()
+        entry = self._prefix_index.get(h)
+        if entry is None:
+            return None
+        # Need at least one suffix token to forward. (Same condition we used
+        # when caching, but enforce on the lookup side too.)
+        if request.prompt_len <= entry.num_tokens:
+            return None
+        # Touch for LRU.
+        self._prefix_index.move_to_end(h)
+        entry.last_used = time.time()
+        return entry
+
+    async def _maybe_cache_prefix(
+        self, request: Request, alloc: KVAllocation, kv: Dict[str, Any]
+    ) -> None:
+        cache_blocks = self._max_prefix_blocks_for_request(request)
+        if cache_blocks < self._prefix_min_blocks:
+            return
+        cache_tokens = cache_blocks * self.partition.block_size_tokens
+        h = request.prefix_hash()
+        if h in self._prefix_index:
+            # Already cached (a duplicate raced in or this is a re-prefill).
+            self._prefix_index.move_to_end(h)
+            return
+
+        snapshot = await self.backend.snapshot_prefix(
+            request.request_id, kv, cache_tokens,
+        )
+        prefix_block_ids = list(alloc.block_ids[:cache_blocks])
+        owner_id = _prefix_owner_id(h)
+        try:
+            self.allocator.allocate(
+                request_id=owner_id,
+                num_tokens=cache_tokens,
+                preemptible=False,
+                priority=0.0,
+                share_block_ids=prefix_block_ids,
+            )
+        except (ValueError, RuntimeError):
+            # Allocator already has this synthetic owner registered.
+            return
+
+        self._prefix_index[h] = _PrefixEntry(
+            prefix_hash=h,
+            num_tokens=cache_tokens,
+            num_blocks=cache_blocks,
+            block_ids=prefix_block_ids,
+            kv_snapshot=snapshot,
+            last_used=time.time(),
+        )
+        self._evict_prefix_if_full()
+
+    def _evict_prefix_if_full(self) -> None:
+        while len(self._prefix_index) > self._prefix_capacity:
+            old_hash, _ = self._prefix_index.popitem(last=False)
+            # Drops the synthetic owner's refcount; blocks return to free pool
+            # iff no live request currently shares them.
+            self.allocator.free(_prefix_owner_id(old_hash))
+
+    def prefix_cache_snapshot(self) -> Dict[str, int]:
+        """Map of prefix_hash -> cached blocks, for the router's prefix_cache hint."""
+        return {h: e.num_blocks for h, e in self._prefix_index.items()}
+
     # ---- request lifecycle (called by scheduler) -------------------------------
 
     async def admit_prefill(self, request: Request) -> int:
-        """Allocate KV for prompt, run prefill, return first token."""
+        """Allocate KV for prompt, run prefill, return first token.
+
+        On a prefix-cache hit, the allocator shares the cached prefix's blocks
+        via refcount and the backend resumes prefill from the cached position
+        — saving both KV memory and the prefix's prefill compute.
+        """
+        entry = self._prefix_lookup(request)
+        if entry is not None:
+            return await self._admit_prefill_with_cache(request, entry)
+        return await self._admit_prefill_fresh(request)
+
+    async def _admit_prefill_fresh(self, request: Request) -> int:
         alloc = self.allocator.allocate(
             request_id=request.request_id,
             num_tokens=request.prompt_len,
             preemptible=True,
             priority=request.priority,
         )
+        self.prefix_misses += 1
         t0 = time.perf_counter()
         first_token, kv = await self.backend.prefill(request)
         ttft_ms = (time.perf_counter() - t0) * 1000.0
@@ -359,6 +656,44 @@ class Engine:
             alloc=alloc,
             last_token=first_token,
             kv_state=kv,
+            decode_eligible=(self.role != EngineRole.PREFILL),
+        )
+        seq.output.append(first_token)
+        seq.tokens_produced = 1
+        self._active[request.request_id] = seq
+        self._completion_events[request.request_id] = asyncio.Event()
+
+        # Snapshot a prefix-portion of this request's KV for future hits.
+        await self._maybe_cache_prefix(request, alloc, kv)
+        return first_token
+
+    async def _admit_prefill_with_cache(
+        self, request: Request, entry: _PrefixEntry,
+    ) -> int:
+        # Refcount-share the cached prefix's blocks; allocate fresh blocks
+        # only for the suffix.
+        alloc = self.allocator.allocate(
+            request_id=request.request_id,
+            num_tokens=request.prompt_len,
+            preemptible=True,
+            priority=request.priority,
+            share_block_ids=entry.block_ids,
+        )
+        self.prefix_hits += 1
+        self.prefix_tokens_saved += entry.num_tokens
+        t0 = time.perf_counter()
+        first_token, kv = await self.backend.prefill(
+            request, cached_kv=entry.kv_snapshot, cached_tokens=entry.num_tokens,
+        )
+        ttft_ms = (time.perf_counter() - t0) * 1000.0
+        self.recent_ttft_ms = ttft_ms
+
+        seq = _ActiveSeq(
+            request=request,
+            alloc=alloc,
+            last_token=first_token,
+            kv_state=kv,
+            decode_eligible=(self.role != EngineRole.PREFILL),
         )
         seq.output.append(first_token)
         seq.tokens_produced = 1
@@ -392,23 +727,25 @@ class Engine:
         self._completion_events[request.request_id] = asyncio.Event()
 
     async def step(self) -> List[str]:
-        """One iteration: advance every active sequence by one token. Returns finished ids."""
-        if not self._active:
+        """One iteration: advance every decode-eligible sequence by one token.
+        Returns finished ids."""
+        # Skip seqs that aren't ready to decode (e.g., prefill seqs in the
+        # disaggregated path that are awaiting handoff + eviction).
+        eligible = [(rid, seq) for rid, seq in list(self._active.items())
+                    if seq.decode_eligible]
+        if not eligible:
             return []
         finished: List[str] = []
         t0 = time.perf_counter()
 
-        # Run all sequences in parallel for this iteration.
         async def _one(rid: str, seq: _ActiveSeq) -> Optional[str]:
             tok = await self.backend.decode_step(rid, seq.last_token, seq.kv_state)
             seq.output.append(tok)
             seq.last_token = tok
             seq.tokens_produced += 1
-            # Grow KV by one token; may need a fresh block.
             try:
                 self.allocator.extend(rid, extra_tokens=1)
             except RuntimeError:
-                # Out of KV mid-decode — abort this seq, scheduler will spill.
                 seq.done.set()
                 return rid
 
@@ -417,16 +754,13 @@ class Engine:
                 return rid
             return None
 
-        results = await asyncio.gather(
-            *[_one(rid, seq) for rid, seq in list(self._active.items())]
-        )
+        results = await asyncio.gather(*[_one(rid, seq) for rid, seq in eligible])
         for rid in results:
             if rid is not None:
                 finished.append(rid)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        # Average per-seq ms is a fine TPOT proxy when batching is uniform.
-        n = max(1, len(self._active))
+        n = max(1, len(eligible))
         self.recent_tpot_ms = elapsed_ms / n
         return finished
 
@@ -486,4 +820,12 @@ class Engine:
             "kv": self.allocator.snapshot(),
             "recent_ttft_ms": self.recent_ttft_ms,
             "recent_tpot_ms": self.recent_tpot_ms,
+            "prefix_cache": {
+                "entries": len(self._prefix_index),
+                "capacity": self._prefix_capacity,
+                "hits": self.prefix_hits,
+                "misses": self.prefix_misses,
+                "tokens_saved": self.prefix_tokens_saved,
+                "pinned_blocks": sum(e.num_blocks for e in self._prefix_index.values()),
+            },
         }

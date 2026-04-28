@@ -136,7 +136,12 @@ class LocalScheduler:
 
             await self._drain_wait_queue()
 
-            if step_period_s > 0:
+            if not finished and step_period_s == 0:
+                # _active is non-empty but nothing was decoded (e.g., prefill
+                # seqs awaiting handoff in the disaggregated path). Yield
+                # briefly so we don't busy-loop on step() returning [].
+                await asyncio.sleep(0.001)
+            elif step_period_s > 0:
                 await asyncio.sleep(step_period_s)
 
     async def _drain_wait_queue(self) -> None:

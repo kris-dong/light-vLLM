@@ -2,10 +2,32 @@
 Paged KV-block allocator (vLLM-style, distilled).
 
 A request's KV is stored as a list of fixed-size token blocks. The allocator
-hands out free block ids, supports eviction of preemptible owners, and tracks a
-prefix-share counter so two sequences can share the same on-disk blocks for an
-identical prefix (used by the router's prefix_cache hint, kept here as a
-reference count so we never free a block another seq depends on).
+hands out free block ids, supports eviction of preemptible owners, and tracks
+a per-block reference count so multiple owners can share the same blocks for
+an identical prefix.
+
+How prefix sharing actually works end-to-end (wired by the Engine):
+
+  1. After a fresh prefill, the Engine takes the first N blocks of the
+     request's allocation (where N covers a prefix-hash window) and registers
+     them under a synthetic owner id ``__prefix__:<hash>`` via
+     ``allocate(..., share_block_ids=those_block_ids, preemptible=False)``.
+     This bumps each block's refcount, pinning them past the original
+     request's lifetime.
+
+  2. On a future ``allocate(..., share_block_ids=cached_block_ids)`` for a
+     request whose prompt prefix matches, the cached block ids are reused
+     (refcount +1) and only suffix blocks are pulled from the free pool —
+     a real KV-memory saving plus a real prefill-compute saving (the engine
+     also passes the cached KV tensors to the backend so it forwards only
+     the suffix).
+
+  3. ``free`` decrements refcount on every owned block; a block returns to
+     the free pool only when refcount hits 0 — i.e., when both the request
+     and any prefix-cache owner have released it.
+
+  4. The Engine evicts old prefixes (LRU) by calling ``free`` on the synthetic
+     owner; if no live request still references those blocks they become free.
 """
 
 from __future__ import annotations

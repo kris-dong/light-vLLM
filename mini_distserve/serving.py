@@ -86,6 +86,9 @@ class ServingSystem:
             total_kv_blocks=ks["total_blocks"],
             free_kv_blocks=ks["free_blocks"],
             evictable_kv_blocks=ks["evictable_blocks"],
+            # Tell the router which prefixes this engine has hot — so prefix
+            # benefit scoring actually does something at runtime.
+            prefix_cache=engine.prefix_cache_snapshot(),
             recent_ttft_ms=engine.recent_ttft_ms,
             recent_tpot_ms=engine.recent_tpot_ms,
             tensor_parallel_size=engine.partition.layout.tensor_parallel_size,
