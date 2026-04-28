@@ -263,10 +263,14 @@ class LLMRouter:
 
         if role in (EngineRole.PREFILL, EngineRole.COLOCATED):
             if request.ttft_slo_ms is not None:
-                predicted_ttft = (
-                    predicted_queue_ms
-                    + predicted_prefill_ms
-                    + max(engine.recent_ttft_ms, 0.0)
+                # Predict TTFT as queue+prefill from the cost model, but never
+                # claim it'll be lower than the engine's last observed TTFT —
+                # that observation is empirical proof of how the engine
+                # actually behaves under current load. Cold engines have
+                # recent_ttft_ms = 0, so the floor doesn't bind for them.
+                predicted_ttft = max(
+                    predicted_queue_ms + predicted_prefill_ms,
+                    max(engine.recent_ttft_ms, 0.0),
                 )
                 risk += max(0.0, predicted_ttft / request.ttft_slo_ms - 1.0)
 
