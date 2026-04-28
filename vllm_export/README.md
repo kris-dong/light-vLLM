@@ -90,3 +90,47 @@ curl http://127.0.0.1:8001/v1/models
 - Container name is `vllm-export-server` by default; existing container with that name is removed on launch.
 - Docker publishes only on localhost (`127.0.0.1`) so the API is not exposed on external interfaces by default.
 - HF cache is persisted at `../.hf-cache-vllm-export` by default so model downloads are reused.
+
+Difference between running LLM with `vllm-export-server`'s default VLLM framework vs running LLM with `mini_distserve`'s light-vLLM: 
+
+```bash
+  ┌──────────────────────────────┬─────────────────┬────────────────────────────────────────┐    
+  │            Signal            │      Value      │                Meaning                 │    
+  ├──────────────────────────────┼─────────────────┼────────────────────────────────────────┤ 
+  │ awq_linear_modules=196       │ 28 layers × 7   │ Real AWQ-quantized linear modules in   │    
+  │                              │ linears         │ the loaded model                       │  
+  ├──────────────────────────────┼─────────────────┼────────────────────────────────────────┤    
+  │ model class=Qwen2ForCausalLM │ —               │ Actual transformers Qwen2ForCausalLM,  │
+  │                              │                 │ not a stub                             │    
+  ├──────────────────────────────┼─────────────────┼────────────────────────────────────────┤  
+  │ cuda:2 delta: -4.71 GiB      │ After load      │ Quantized weights physically landed on │    
+  │                              │                 │  GPU2                                  │    
+  ├──────────────────────────────┼─────────────────┼────────────────────────────────────────┤
+  │ "The capital of France is    │ —               │ Real argmax output from the AWQ        │    
+  │ Paris."                      │                 │ Qwen-7B forward pass                   │    
+  └──────────────────────────────┴─────────────────┴────────────────────────────────────────┘
+                                                                                                 
+  The mini_distserve.demo now mirrors query_llm.py's payload shape:                              
+  
+  ┌────────────────────────────────────┬─────────────────────────────────────────────────────┐   
+  │     query_llm.py (HTTP → vLLM)     │          mini_distserve.demo (in-process)           │ 
+  ├────────────────────────────────────┼─────────────────────────────────────────────────────┤   
+  │ Builds [{system}, {user}] chat     │ Same — _apply_chat_template()                       │ 
+  │ messages                           │                                                     │
+  ├────────────────────────────────────┼─────────────────────────────────────────────────────┤   
+  │ POST /v1/chat/completions to vLLM  │ ServingSystem.submit() to local engines             │   
+  ├────────────────────────────────────┼─────────────────────────────────────────────────────┤   
+  │ vLLM does prefill+decode           │ Our prefill engine (cuda:2) → KV transfer → decode  │   
+  │ internally                         │ engine (cuda:0)                                     │ 
+  ├────────────────────────────────────┼─────────────────────────────────────────────────────┤   
+  │ Builds [{system}, {user}] chat     │ Same — _apply_chat_template()                       │
+  │ messages                           │                                                     │
+  ├────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ POST /v1/chat/completions to vLLM  │ ServingSystem.submit() to local engines             │
+  ├────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ vLLM does prefill+decode           │ Our prefill engine (cuda:2) → KV transfer → decode  │
+  │ internally                         │ engine (cuda:0)                                     │
+  ├────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Returns choices[0].message.content │ Tokenizer.decode of r.output_tokens                 │
+  └────────────────────────────────────┴─────────────────────────────────────────────────────
+```
