@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# HuggingFace caches and model weights (multi-GB, not source)
+.hf-cache-vllm-export/
+hf-cache/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Claude Code workspace state
+.claude/
+
+# vllm_export runtime artifacts
+vllm_export/output.log
+vllm_export/output_new.log
+vllm_export/__pycache__/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
