@@ -183,6 +183,30 @@ Public re-exports. Pulls `Engine`, `MockBackend`, `TransformersBackend`, `LLMRou
 - `route(request, role)` — score every engine and pick the lowest. Raises if no candidate.
 - `route_disaggregated(request)` — calls `route` twice (PREFILL, then DECODE) and returns both decisions.
 
+### What `risk` means in `_slo_risk_score`
+
+`risk` is one component of the routing score the `LLMRouter` computes for each engine. Lower total score wins, and `risk` is a positive contribution (weighted by `w_slo_risk`, default 3.0), so **a higher `risk` makes the router less likely to send the request to that engine.**
+
+Concretely, `risk` answers: *"How much does this engine's expected behavior overshoot the request's SLO?"*
+
+It's measured as a **fractional overshoot**, not an absolute time:
+
+| Predicted vs. SLO | Risk contribution |
+|---|---|
+| Predicted ≤ SLO (on-spec) | `0` |
+| Predicted = 1.5× SLO | `0.5` |
+| Predicted = 3× SLO | `2.0` |
+
+The formula: `risk += max(0, predicted / SLO − 1)`.
+
+Two SLOs feed in:
+- **TTFT (time to first token)** — for engines that will run prefill. Compares `max(queue_delay + prefill_time, recent_ttft)` against the request's `ttft_slo_ms`. The `max(...)` means: trust the cost model's prediction normally, but never claim the engine will be faster than what it just demonstrated. Cold engines (`recent_ttft = 0`) fall through to the model-only path.
+- **TPOT (time per output token)** — for engines that will run decode. Compares the engine's `recent_tpot_ms` directly against `tpot_slo_ms` (skipped while `recent_tpot_ms == 0`, i.e. before the engine has done any decode).
+
+Both are summed, then divided by `request.priority` so high-priority requests get *less* effective penalty for the same predicted overshoot.
+
+**Why fractions, not absolute milliseconds?** A 200 ms overshoot on a 100 ms SLO (latency-critical chat) is much worse than a 200 ms overshoot on a 5000 ms SLO (long-form generation). Normalizing by the SLO makes the score comparable across requests with different deadlines.
+
 The `__main__` block is a self-test that registers four engines and prints colocated and disaggregated decisions.
 
 ---
