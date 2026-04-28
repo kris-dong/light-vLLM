@@ -2,47 +2,6 @@
 
 The package implements a small-scale model of a disaggregated LLM serving system (DistServe / Splitwise-style) where prefill and decode run on separate engine pools. Below is a per-file breakdown of every function.
 
-```bash
- ┌──────────────────────────────┬─────────────────┬────────────────────────────────────────┐    
-  │            Signal            │      Value      │                Meaning                 │    
-  ├──────────────────────────────┼─────────────────┼────────────────────────────────────────┤ 
-  │ awq_linear_modules=196       │ 28 layers × 7   │ Real AWQ-quantized linear modules in   │    
-  │                              │ linears         │ the loaded model                       │  
-  ├──────────────────────────────┼─────────────────┼────────────────────────────────────────┤    
-  │ model class=Qwen2ForCausalLM │ —               │ Actual transformers Qwen2ForCausalLM,  │
-  │                              │                 │ not a stub                             │    
-  ├──────────────────────────────┼─────────────────┼────────────────────────────────────────┤  
-  │ cuda:2 delta: -4.71 GiB      │ After load      │ Quantized weights physically landed on │    
-  │                              │                 │  GPU2                                  │    
-  ├──────────────────────────────┼─────────────────┼────────────────────────────────────────┤
-  │ "The capital of France is    │ —               │ Real argmax output from the AWQ        │    
-  │ Paris."                      │                 │ Qwen-7B forward pass                   │    
-  └──────────────────────────────┴─────────────────┴────────────────────────────────────────┘
-                                                                                                 
-  The mini_distserve.demo now mirrors query_llm.py's payload shape:                              
-  
-  ┌────────────────────────────────────┬─────────────────────────────────────────────────────┐   
-  │     query_llm.py (HTTP → vLLM)     │          mini_distserve.demo (in-process)           │ 
-  ├────────────────────────────────────┼─────────────────────────────────────────────────────┤   
-  │ Builds [{system}, {user}] chat     │ Same — _apply_chat_template()                       │ 
-  │ messages                           │                                                     │
-  ├────────────────────────────────────┼─────────────────────────────────────────────────────┤   
-  │ POST /v1/chat/completions to vLLM  │ ServingSystem.submit() to local engines             │   
-  ├────────────────────────────────────┼─────────────────────────────────────────────────────┤   
-  │ vLLM does prefill+decode           │ Our prefill engine (cuda:2) → KV transfer → decode  │   
-  │ internally                         │ engine (cuda:0)                                     │ 
-  ├────────────────────────────────────┼─────────────────────────────────────────────────────┤   
-  │ Builds [{system}, {user}] chat     │ Same — _apply_chat_template()                       │
-  │ messages                           │                                                     │
-  ├────────────────────────────────────┼─────────────────────────────────────────────────────┤
-  │ POST /v1/chat/completions to vLLM  │ ServingSystem.submit() to local engines             │
-  ├────────────────────────────────────┼─────────────────────────────────────────────────────┤
-  │ vLLM does prefill+decode           │ Our prefill engine (cuda:2) → KV transfer → decode  │
-  │ internally                         │ engine (cuda:0)                                     │
-  ├────────────────────────────────────┼─────────────────────────────────────────────────────┤
-  │ Returns choices[0].message.content │ Tokenizer.decode of r.output_tokens                 │
-  └────────────────────────────────────┴─────────────────────────────────────────────────────
-```
 ## Downloading the model from HuggingFace
 
 The demo defaults to **`Qwen/Qwen2.5-7B-Instruct-AWQ`** (~5 GiB of AWQ INT4 weights). It's a public model — no HF login required — but you do need to materialize a snapshot on disk before the demo can load it. The recommended cache root for this repo is `/scratch/kris/local-llm/.hf-cache-vllm-export` so the same weights are reused by both `mini_distserve` and the `vllm_export` Docker setup.
